@@ -1,0 +1,247 @@
+# Kafka 消费者组
+
+Kafka 消费者组是可扩展并具有容错性的消费者机制
+
+消费者组有多个消费者或者消费者实例，它们共享一个公共的 Group ID。
+
+理想情况，消费者实例应该等于分区数量。
+
+## Rebalance
+
+### 触发 Rebalance 的条件：
+
+1. 组成员发生变更。如 consumer 实例的增加或减少，增加 consumer 一般情况下都是为了增加 TPS 或者提高伸缩性。
+2. 订阅的主题数量发生变化。如 consumer 是通过正则匹配可以订阅的主题。
+3. 订阅的主题分区数量发生变化。
+
+### Rebalance 的缺点：
+
+1. 影响 Consumer 端的 TPS。因为 Rebalance 会导致 Consumer 停下手头的所有事情，什么也不干。
+2. Rebalance 很慢。用户例子，Group 下有几百个 Consumer 实例，Rebalance 一次需要几个小时。
+3. Rebalance 效率不高。Group 下所有成员都会参与，而且通常不会考虑局部性原理，但是局部性原理对提升系统性能特别重要。每次 Rebalance 时，之前的分配方案都不会保留
+
+Rebalance 的过程，所有的 consumer 实例都会停止消费，直到 rebalance 完成。打散所有分区，然后重新把这些分区分配给 Group 中的 consumer。这个 Group 下的所有 consumer 都参与 rebalance，这就可能导致 consumer A 之前消费 1，2 这两个分区，rebalance 后，消费的是 3，4两个分区，这就需要断开之前的 TCP 连接，重新创建新的 TCP 连接，消耗更多的资源。
+
+**Rebalance 后，Consumer 实例会从上一次提交的位移开始消费，可能造成重复消费。**
+
+### Rebalance 如何避免：
+
+1. 避免 consumer 实例的增减。当 consumer group 完成 rebalance 后，每个 consumer 实例都会定期向 coordinator 发送心跳请求，表明它还活着。通过 Consumer 端的参数 session.timeout.ms 来判断心跳请求是否超时。Coordinator 在 session.timeout.ms 的时间内没有收到心跳请求，则判断这个 consumer 实例挂掉了。Consumer 还有个参数 heartbeat.interval.ms。这个值越小， Consumer 实例发送心跳请求的频率越高。但是频繁的发送心跳请求会消耗更多的带宽资源，好处是能够更快地知道当前是否开启 rebalance。因为，目前 Coordinator 通知各个 consumer 实例开启 rebalance 的方法就是将 REBALANCE_NEEDED 标志封装进心跳请求的响应体中。Consumer 端还有个参数 max.poll.interval.ms，它限定了 consumer 端应用程序两次调用 poll 方法的最大时间间隔。默认是 5 分钟，表示如果 consumer 程序没有在 5 分钟能消费完 poll 方法返回的消息，那么 consumer 会主动发起**离开组**的请求，然后 coordinator 会开启新一轮的 rebalance。
+2. 适当设置 session.timeout.ms 和 heartbeat.interval.ms，一般要保证前者是后者的三倍，也就是在 consumer 被判定挂掉之前，至少发送三轮的心跳请求。
+3. 避免 consumer 消费时间过长超过 max.poll.interval.ms，一般这是由下游组件的最大处理时间决定的。例如是要将数据写入一个数据库中，那么就要将这个参数的时间设置为大于数据库的写操作时间。
+4. 避免 Consumer 端频繁的 Full GC。
+
+## 分区分配策略
+
+在 Rebalance 过程中，Coordinator 需要将订阅主题的分区重新分配给消费者组内的各个消费者实例。Kafka 提供了多种分区分配策略来满足不同的使用场景。
+
+### 1. Range Assignor（范围分配策略）
+
+#### 工作原理：
+
+- 按**主题**为单位进行分配
+- 对每个主题的分区按顺序分配给消费者
+- 分区号连续的分区会分配给同一个消费者
+
+#### 示例：
+
+```
+主题 A: 分区 0,1,2,3
+主题 B: 分区 0,1,2,3  
+消费者: C1, C2
+
+分配结果：
+C1: A0,A1, B0,B1
+C2: A2,A3, B2,B3
+```
+
+#### 优缺点：
+
+- **优点**：支持多主题联合查询，相同分区号的分区在同一消费者，便于按 key 进行关联
+- **缺点**：可能导致负载不均衡，如果分区数不能被消费者数整除，前面的消费者会分配更多分区
+
+### 2. RoundRobin Assignor（轮询分配策略）
+
+#### 工作原理：
+
+- 打破主题边界，将**所有主题的所有分区**统一排序
+- 按轮询方式依次分配给消费者
+
+#### 示例：
+
+```
+主题 A: 分区 0,1,2
+主题 B: 分区 0,1,2
+消费者: C1, C2
+
+所有分区: A0,A1,A2,B0,B1,B2
+
+分配结果：
+C1: A0,A2,B1
+C2: A1,B0,B2
+```
+
+#### 优缺点：
+
+- **优点**：负载更均衡，最大化并行度
+- **缺点**：失去了同主题相同分区号的关联性，不适合需要按 key 关联的场景
+
+### 3. Sticky Assignor（粘性分配策略）
+
+#### 工作原理：
+
+- 基于 RoundRobin 的改进版本
+- **尽可能保持之前的分配结果**
+- 只有在必要时才重新分配分区
+
+#### 特点：
+
+- 初始分配类似 RoundRobin
+- Rebalance 时尽量减少分区迁移
+- 降低 Rebalance 的成本
+
+#### 优缺点：
+
+- **优点**：减少状态重建开销，提高 Rebalance 效率，负载相对均衡
+- **缺点**：逻辑相对复杂
+
+### 4. CooperativeSticky Assignor（协作粘性分配策略）
+
+#### 工作原理：
+
+- Sticky Assignor 的协作版本
+- **增量式 Rebalance**，避免"停止世界"问题
+- 分两阶段进行：先撤销、后分配
+
+#### 特点：
+
+- 第一阶段：只撤销需要重新分配的分区
+- 第二阶段：将撤销的分区分配给新消费者
+- 未受影响的分区**持续处理**
+
+#### 优缺点：
+
+- **优点**：最小化处理中断，更高效的 Rebalance 过程，保持粘性分配的优势
+- **缺点**：需要客户端支持协作式重平衡协议
+
+### 分配策略配置
+
+#### 在 Consumer 配置中设置：
+
+```properties
+# 设置单个分配策略
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+# 设置多个分配策略（按优先级）
+partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor,org.apache.kafka.clients.consumer.StickyAssignor
+```
+
+#### Java 代码配置：
+
+```java
+Properties props = new Properties();
+props.put("partition.assignment.strategy", 
+    "org.apache.kafka.clients.consumer.CooperativeStickyAssignor");
+```
+
+### 分配策略的执行位置
+
+#### Classic Protocol（经典协议）：
+
+1. Consumer 发送 JoinGroup 请求到 Group Coordinator
+2. Coordinator 选择一个 Consumer 作为 Group Leader
+3. **Group Leader 在客户端执行分配策略**
+4. Leader 将分配结果发送给 Coordinator
+5. Coordinator 将分配结果分发给所有 Consumer
+
+#### Consumer Rebalance Protocol（新协议）：
+
+1. Consumer 发送订阅信息到 Group Coordinator
+2. **Coordinator 在服务端执行分配策略**
+3. Coordinator 直接将分配结果发送给各个 Consumer
+
+### 使用建议
+
+- **Range Assignor** 适用于：需要多主题按 key 进行关联的场景
+- **RoundRobin Assignor** 适用于：追求最大并行度和负载均衡的场景
+- **Sticky/CooperativeSticky Assignor** 适用于：有状态的消费者应用，频繁发生 Rebalance 的环境
+
+**推荐**：在生产环境中，优先选择 **CooperativeStickyAssignor**，它提供了最好的性能和稳定性平衡。
+
+# Consumer 位移
+
+消费位移主题的是表示 consumer 实例消费的位移，消费位移记录在 _consumer_offset(位移主题) 主题中。
+
+位移主题包含三种不同格式的消息：
+
+### 1. 位移提交消息（Offset Commit Messages）
+- **Key**: `group id + 主题名称 + 分区号`
+- **Value**: 包含位移值、元数据、时间戳等
+- **用途**: 记录消费者组对特定分区的消费位移
+
+### 2. 消费者组元数据消息（Group Metadata Messages）
+- **Key**: `group id`
+- **Value**: 包含组的元数据信息（成员列表、分区分配策略、协议类型等）
+- **用途**: 保存消费者组的配置和状态信息
+
+### 3. 墓碑消息（Tombstone Messages）
+- **Key**: `group id` 或 `group id + 主题名称 + 分区号`
+- **Value**: `null`
+- **用途**: 用于删除过期位移数据或消费者组信息。当某个 Consumer Group 下的所有 Consumer 实例都停止了，而且它们的位移数据都已经被删除，Kafka 会向位移主题写入 tombstone 消息，表明要彻底删除相关数据。
+
+位移主题可以手动也可以自动创建，一般都是有了 consumer 之后，这个主题就会自动被创建。
+
+Consumer 既可以自动提交也可以手动提交。由 consumer 的配置文件中 enable.auto.commit 参数控制。自动提交的好处是省事，但是这会导致 consumer 根据 auto.commit.interval.ms 间歇性提交 offset，对磁盘产生压力。
+
+Kafka 通过 compact 策略来删除位移主题中的过期消息，避免了位移主题无限期膨胀。Compact 的过程就是通过扫描日志的所有消息，删除过期的消息，再把剩下的消息整理一下。Compact 策略是由 Kafka 的后台线程 Log Cleaner 控制的，定期检查需要 Compact 的主题。
+
+# Coordinator
+
+## Coordinator 的主要职责
+
+Coordinator 是 Kafka 中负责管理 Consumer Group 的核心组件，主要职责包括：
+
+### 1. Consumer Group 成员管理
+
+- 维护 Consumer Group 中所有消费者实例的状态
+- 处理消费者实例的加入（JoinGroup）和离开（LeaveGroup）请求
+- 监控消费者实例的心跳状态，判断消费者是否存活
+- 管理消费者实例的元数据信息
+
+### 2. Rebalance 协调
+
+- 检测触发 Rebalance 的条件（成员变更、主题变更、分区变更等）
+- 协调 Rebalance 过程，确保所有消费者实例参与
+- 执行分区分配策略（Range、RoundRobin、Sticky 等）
+- 通知所有消费者实例新的分区分配结果
+- 确保 Rebalance 过程的一致性和正确性
+
+### 3. 位移管理
+
+- 接收和处理消费者提交的位移信息
+- 将位移数据写入位移主题（__consumer_offsets）
+- 响应消费者的位移查询请求
+- 管理位移数据的清理和压缩
+
+### 4. Consumer Group 状态管理
+
+Consumer Group 有以下几种状态，由 Coordinator 进行管理：
+
+- **Empty**: 组内没有任何消费者实例
+- **Dead**: 组内没有消费者实例且元数据已被删除
+- **PreparingRebalance**: 准备开始 Rebalance
+- **CompletingRebalance**: 等待所有消费者实例重新加入组
+- **Stable**: 组处于稳定状态，正常消费
+
+### 5. 心跳处理
+
+- 接收消费者实例定期发送的心跳请求
+- 通过心跳响应通知消费者实例 Rebalance 等重要事件
+- 根据心跳超时判断消费者实例是否失效
+
+## 如何确定 Consumer Group 的 Coordinator
+
+1. 确定由位移主题的哪个分区来保存该 Group 的数据。
+
+   partitionId=Math.abs(groupId.hashCode() % offsetsTopicPartitionCount)
+2. Coordinator 即运行在该分区 Leader 副本所在的 Broker。
